@@ -5,7 +5,9 @@ Automates the generation of PDF files from the Polish land registry viewer (Elek
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv /tmp/venv.PDF
+source /tmp/venv.PDF/bin/activate
+python3 -m pip install -r requirements.txt
 playwright install chromium
 ```
 
