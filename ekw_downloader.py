@@ -8,10 +8,16 @@ Automates the generation of PDF files from the Polish land registry viewer.
 import sys
 import re
 import time
+import csv
+import logging
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright_stealth import Stealth
 from PyPDF2 import PdfMerger
-from datetime import datetime
+
+# Error logging (used in batch mode)
+LOG_FILE = Path("ekw_errors.log")
+logger = logging.getLogger(__name__)
 
 
 class EKWDownloader:
@@ -25,17 +31,17 @@ class EKWDownloader:
         self.screenshots_dir.mkdir(exist_ok=True)
 
     def validate_entry_number(self, entry_number: str) -> bool:
-        """Validate the format of the entry number (e.g., WA2M/00436586/7)"""
+        """Validate the format of the entry number (e.g., KR1P/00012345/4)"""
         pattern = r'^[A-Z0-9]+/\d+/\d+$'
         return bool(re.match(pattern, entry_number))
 
     def parse_entry_number(self, entry_number: str) -> dict:
         """
         Parse entry number into components.
-        Format: WA2M/00436586/7
-        - Court code: WA2M
-        - Number: 00436586
-        - Control digit: 7
+        Format: KR1P/00012345/4
+        - Court code: KR1P
+        - Number: 00012345
+        - Control digit: 4
         """
         parts = entry_number.split('/')
         return {
@@ -50,7 +56,7 @@ class EKWDownloader:
         Download all pages of a land registry entry and generate a PDF.
 
         Args:
-            entry_number: The entry number (e.g., WA2M/00436586/7)
+            entry_number: The entry number (e.g., KR1P/00012345/4)
             output_file: Optional output filename (defaults to {entry_number}.pdf)
 
         Returns:
@@ -66,37 +72,44 @@ class EKWDownloader:
 
         print(f"Starting download for entry: {entry_number}")
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
+        launch_args = [
+            '--disable-blink-features=AutomationControlled',
+            '--no-sandbox',
+        ]
+        if self.headless:
+            launch_args.append('--headless=new')  # Chrome's less-detectable headless
+
+        playwright_cm = Stealth().use_sync(sync_playwright()) if self.headless else sync_playwright()
+        with playwright_cm as p:
+            browser = p.chromium.launch(headless=self.headless, args=launch_args)
             context = browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ignore_https_errors=True,
+                locale='pl-PL',
             )
             page = context.new_page()
+            if not self.headless:
+                page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
 
             try:
-                # Navigate to the main page
+                # Navigate to the main page (domcontentloaded so JS can run before we check)
                 print(f"Navigating to {self.BASE_URL}...")
-                page.goto(self.BASE_URL, wait_until='networkidle', timeout=30000)
+                page.goto(self.BASE_URL, wait_until='domcontentloaded', timeout=30000)
+                time.sleep(2)
 
                 # Wait for TSPD (Traffic Server Protection Detection) to complete
                 # The site uses anti-bot protection that needs time to load
-                print("Waiting for anti-bot protection to complete...")
-                time.sleep(5)
-
-                # Wait for the actual form content to appear
-                # Look for any input field or form element to confirm page is loaded
+                print("Waiting for anti-bot protection to complete (up to 55s)...")
                 try:
-                    page.wait_for_selector('input', timeout=15000)
+                    page.wait_for_selector('input[type="text"]', timeout=55000)
                     print("Form elements detected, page loaded successfully")
                 except PlaywrightTimeoutError:
-                    print("Warning: No input fields detected after waiting. Continuing anyway...")
-
-                # Additional wait for JavaScript to fully execute
+                    print("Warning: No input fields detected after 60s. Try with --show-browser if blocked.")
                 time.sleep(2)
 
                 # Parse the entry number into 3 parts
-                # Format: WA2M/00436586/7 -> court_code, number, control
+                # Format: KR1P/00012345/4 -> court_code, number, control
                 entry_parts = self.parse_entry_number(entry_number)
                 print(f"Entry parts: Court={entry_parts['court_code']}, Number={entry_parts['number']}, Control={entry_parts['control']}")
 
@@ -231,11 +244,10 @@ class EKWDownloader:
 
                 print("Now on the land registry content page!\n")
 
-                # Collect all pages/sections
-                pdf_pages = []
+                # Collect PDF for each section (browser print = copyable text)
+                tab_pdf_paths = []
 
                 # The 5 tabs we need to capture:
-                # Tabs are submit buttons with value="Dział I-O", etc.
                 tab_names = [
                     "Dział I-O",
                     "Dział I-Sp",
@@ -244,21 +256,14 @@ class EKWDownloader:
                     "Dział IV"
                 ]
 
-                print(f"Capturing {len(tab_names)} tabs...")
+                print(f"Capturing {len(tab_names)} tabs as PDF (copyable text)...")
 
-                # Capture each tab by clicking its submit button
                 for idx, tab_name in enumerate(tab_names):
                     try:
                         clean_name = tab_name.replace('/', '_').replace(' ', '_')
-                        print(f"  [{idx + 1}/{len(tab_names)}] Looking for tab: {tab_name}...")
+                        print(f"  [{idx + 1}/{len(tab_names)}] Tab: {tab_name}...")
 
-                        # Find the submit button for this tab
-                        # The tabs are <input type="submit" value="Dział I-O"> etc.
-                        tab_button = None
-
-                        # Use CSS selector to find input[type="submit"] with specific value
                         selector = f'input[type="submit"][value="{tab_name}"]'
-
                         try:
                             tab_button = page.wait_for_selector(selector, timeout=3000)
                         except PlaywrightTimeoutError:
@@ -267,43 +272,49 @@ class EKWDownloader:
                             continue
 
                         if not tab_button:
-                            print(f"      ✗ Could not find tab: {tab_name}")
                             continue
 
-                        print(f"      Found submit button, clicking...")
-
-                        # Click the submit button
                         tab_button.click()
                         page.wait_for_load_state('networkidle')
                         time.sleep(2)
 
-                        # Capture screenshot of this tab (full page to get all content)
-                        screenshot_path = self.screenshots_dir / f"page_{idx+1:02d}_{clean_name}.png"
-                        page.screenshot(path=str(screenshot_path), full_page=True)
-                        pdf_pages.append(screenshot_path)
-                        print(f"      ✓ Captured: {screenshot_path.name}")
+                        # Export as PDF (Chromium uses real DOM text = copyable)
+                        tab_pdf = self.screenshots_dir / f"tab_{idx+1:02d}_{clean_name}.pdf"
+                        page.pdf(
+                            path=str(tab_pdf),
+                            print_background=True,
+                            margin={"top": "0.5cm", "bottom": "0.5cm", "left": "0.5cm", "right": "0.5cm"},
+                        )
+                        tab_pdf_paths.append(tab_pdf)
+                        print(f"      ✓ PDF: {tab_pdf.name}")
 
                     except Exception as e:
                         print(f"      ✗ Error capturing tab '{tab_name}': {e}")
-                        # Save error screenshot
                         try:
                             page.screenshot(path=str(self.screenshots_dir / f"error_tab_{clean_name}.png"))
-                        except:
+                        except Exception:
                             pass
                         continue
 
-                if not pdf_pages:
-                    print("\nWarning: No tabs captured! Taking fallback screenshot...")
-                    page.screenshot(path=str(self.screenshots_dir / "debug_no_tabs.png"))
-                    main_screenshot = self.screenshots_dir / f"page_00_single.png"
-                    page.screenshot(path=str(main_screenshot), full_page=True)
-                    pdf_pages.append(main_screenshot)
+                if not tab_pdf_paths:
+                    raise Exception("No tabs captured. Check screenshots/ for errors.")
 
-                # Generate the final PDF
-                print(f"\nGenerating PDF with {len(pdf_pages)} pages...")
-                self._create_pdf_from_images(pdf_pages, output_file)
+                # Merge all section PDFs into one
+                print(f"\nMerging {len(tab_pdf_paths)} PDFs...")
+                merger = PdfMerger()
+                for p in tab_pdf_paths:
+                    merger.append(str(p))
+                merger.write(output_file)
+                merger.close()
 
-                print(f"✓ PDF generated successfully: {output_file}")
+                # Clean up temporary tab PDFs
+                for p in tab_pdf_paths:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+
+                print(f"✓ PDF generated successfully (copyable text): {output_file}")
                 return output_file
 
             except Exception as e:
@@ -319,107 +330,96 @@ class EKWDownloader:
             finally:
                 browser.close()
 
-    def _create_pdf_from_images(self, image_paths: list, output_file: str):
-        """Convert a list of images to a PDF file, splitting tall images across multiple A4 pages"""
-        from PIL import Image
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.utils import ImageReader
 
-        c = canvas.Canvas(output_file, pagesize=A4)
-        a4_width, a4_height = A4
+def _setup_error_logging():
+    """Configure logger to write errors to file and stderr."""
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        fh.setLevel(logging.ERROR)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+        ch = logging.StreamHandler(sys.stderr)
+        ch.setLevel(logging.ERROR)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
 
-        for img_path in image_paths:
-            if not img_path.exists():
-                continue
 
-            img = Image.open(img_path)
-            img_width, img_height = img.size
+def run_batch(csv_path: str) -> None:
+    """
+    Process all KW from a CSV file (column 'KW'). Runs in headless mode.
+    Logs errors to ekw_errors.log and stderr; continues on failure.
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        logger.error("CSV file not found: %s", csv_path)
+        sys.exit(1)
 
-            # Calculate scaling to fit to A4 width
-            width_ratio = a4_width / img_width
-            scaled_width = a4_width
-            scaled_height = img_height * width_ratio
+    _setup_error_logging()
 
-            # If the scaled image fits on one A4 page, just add it
-            if scaled_height <= a4_height:
-                c.setPageSize(A4)
-                x = 0
-                # Align to top of page
-                y = a4_height - scaled_height
-                c.drawImage(str(img_path), x, y, width=scaled_width, height=scaled_height)
-                c.showPage()
-            else:
-                # Image is too tall - split it across multiple A4 pages
-                # Add overlap between pages (approximately 30% of one line of text)
-                overlap_points = 6  # Overlap in PDF points (30% of ~20pt)
-                overlap_in_original = overlap_points / width_ratio  # Convert to original image pixels
+    entries = []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if "KW" not in (reader.fieldnames or []):
+            logger.error("CSV must have a 'KW' column")
+            sys.exit(1)
+        for row in reader:
+            kw = (row.get("KW") or "").strip()
+            if kw and kw.upper() != "KW":
+                entries.append(kw)
 
-                # Calculate how many A4 pages we need
-                num_pages = int((scaled_height + a4_height - 1) / a4_height)  # Ceiling division
+    if not entries:
+        logger.error("No KW entries found in %s", csv_path)
+        sys.exit(1)
 
-                print(f"      Splitting {img_path.name} across {num_pages} pages (height: {scaled_height:.0f}pt)")
+    downloader = EKWDownloader(headless=True)
+    ok = 0
+    failed = []
 
-                # For each page, we need to crop a portion of the original image
-                for page_num in range(num_pages):
-                    c.setPageSize(A4)
+    print(f"Batch: {len(entries)} entries from {csv_path} (headless)")
+    print(f"Errors will be logged to {LOG_FILE}\n")
 
-                    # Calculate which vertical slice of the original image to use
-                    # In original image coordinates
-                    slice_height_in_original = a4_height / width_ratio
+    for i, entry_number in enumerate(entries, 1):
+        try:
+            downloader.download(entry_number)
+            ok += 1
+            print(f"  [{i}/{len(entries)}] {entry_number} ✓")
+        except Exception as e:
+            failed.append((entry_number, str(e)))
+            logger.error("KW %s: %s", entry_number, e)
+            print(f"  [{i}/{len(entries)}] {entry_number} ✗ {e}")
 
-                    # Apply overlap: start a bit earlier on pages after the first
-                    if page_num > 0:
-                        y_start_in_original = page_num * slice_height_in_original - overlap_in_original
-                    else:
-                        y_start_in_original = 0
-
-                    y_end_in_original = min((page_num + 1) * slice_height_in_original, img_height)
-
-                    actual_slice_height = y_end_in_original - y_start_in_original
-
-                    # Crop the image slice
-                    img_slice = img.crop((0, int(y_start_in_original), img_width, int(y_end_in_original)))
-
-                    # Save temporary slice
-                    temp_slice_path = img_path.parent / f"temp_slice_{page_num}.png"
-                    img_slice.save(temp_slice_path)
-
-                    # Calculate dimensions for this slice when scaled
-                    slice_scaled_height = actual_slice_height * width_ratio
-
-                    # Draw the slice at the top of the page
-                    x = 0
-                    y = a4_height - slice_scaled_height
-
-                    c.drawImage(str(temp_slice_path), x, y, width=scaled_width, height=slice_scaled_height)
-                    c.showPage()
-
-                    # Clean up temp file
-                    temp_slice_path.unlink()
-
-        c.save()
-        print(f"PDF saved: {output_file}")
+    print(f"\nDone: {ok} OK, {len(failed)} failed")
+    if failed:
+        print(f"Failed: {[e[0] for e in failed]}")
+        print(f"See {LOG_FILE} for details.")
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python ekw_downloader.py <entry_number> [--show-browser]")
-        print("Example: python ekw_downloader.py WA2M/00436586/7")
+        print("Usage: python ekw_downloader.py <entry_number|input.csv> [--show-browser]")
+        print("  Single: python ekw_downloader.py KR1P/00012345/4")
+        print("  Batch:  python ekw_downloader.py input.csv  (headless, errors in ekw_errors.log)")
         sys.exit(1)
 
-    entry_number = sys.argv[1]
-    headless = '--show-browser' not in sys.argv
+    arg = sys.argv[1]
+    headless = "--show-browser" not in sys.argv
+
+    if arg.endswith(".csv"):
+        run_batch(arg)
+        return
 
     downloader = EKWDownloader(headless=headless)
-
     try:
-        output_file = downloader.download(entry_number)
+        output_file = downloader.download(arg)
         print(f"\n✓ Success! PDF generated: {output_file}")
     except Exception as e:
+        _setup_error_logging()
+        logger.error("KW %s: %s", arg, e)
         print(f"\n✗ Error: {e}")
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
